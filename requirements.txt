@@ -1,0 +1,5 @@
+PyYAML>=6.0
+click>=8.0
+jinja2>=3.0
+pathlib2>=2.3.7
+jsonschema>=4.0
