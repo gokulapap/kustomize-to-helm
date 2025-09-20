@@ -333,7 +333,9 @@ class HelmChartGenerator:
             
             # Convert resource to Helm template
             helm_resource = self._convert_resource_to_template(resource)
-            template_content.append(yaml.dump(helm_resource, default_flow_style=False))
+            # Post-process to add proper Helm templating
+            processed_yaml = self._post_process_template_yaml(helm_resource)
+            template_content.append(processed_yaml)
         
         # Write template file
         with open(template_path, 'w') as f:
@@ -431,10 +433,9 @@ class HelmChartGenerator:
         if 'annotations' not in metadata:
             metadata['annotations'] = {}
         
-        # Add common annotations if they exist
-        metadata['annotations']['{{- with .Values.commonAnnotations }}'] = None
-        metadata['annotations']['{{- toYaml . | nindent 4 }}'] = None
-        metadata['annotations']['{{- end }}'] = None
+        # Add common annotations if they exist - handle this in post-processing
+        if hasattr(self, 'common_annotations') and self.common_annotations:
+            metadata['annotations'].update(self.common_annotations)
     
     def _write_chart_yaml(self) -> None:
         """Write the Chart.yaml file."""
@@ -569,3 +570,49 @@ Create the name of the service account to use
             f.write(helpers_content)
         
         logger.info("Generated _helpers.tpl")
+    
+    def _post_process_template_yaml(self, resource: Dict[str, Any]) -> str:
+        """Post-process template YAML to add proper Helm templating."""
+        # First, generate the base YAML
+        yaml_content = yaml.dump(resource, default_flow_style=False)
+        
+        # Add common annotations and labels templating
+        if 'metadata' in resource and 'annotations' in resource['metadata']:
+            # Add Helm templating for common annotations
+            annotation_template = """{{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}"""
+            
+            # Insert the template after existing annotations
+            lines = yaml_content.split('\n')
+            in_annotations = False
+            annotation_indent = 0
+            insert_index = -1
+            
+            for i, line in enumerate(lines):
+                if 'annotations:' in line and 'metadata:' in lines[max(0, i-5):i]:
+                    in_annotations = True
+                    annotation_indent = len(line) - len(line.lstrip())
+                elif in_annotations and line.strip() and not line.startswith(' ' * (annotation_indent + 2)):
+                    # We've left the annotations section
+                    insert_index = i
+                    break
+                elif in_annotations and i == len(lines) - 1:
+                    # End of file
+                    insert_index = i + 1
+                    break
+            
+            if insert_index > 0:
+                # Insert the template
+                template_lines = annotation_template.split('\n')
+                formatted_template = []
+                for template_line in template_lines:
+                    if template_line.strip():
+                        formatted_template.append(' ' * (annotation_indent + 2) + template_line.strip())
+                    else:
+                        formatted_template.append('')
+                
+                lines[insert_index:insert_index] = formatted_template
+                yaml_content = '\n'.join(lines)
+        
+        return yaml_content

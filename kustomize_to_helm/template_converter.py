@@ -123,19 +123,15 @@ class TemplateConverter:
         helm_labels = f"{{{{- include \"{self.chart_name}.labels\" . | nindent 4 }}}}"
         metadata['labels']['{{HELM_LABELS}}'] = helm_labels
         
-        # Common labels from values
-        metadata['labels']['{{- with .Values.commonLabels }}'] = None
-        metadata['labels']['{{- toYaml . | nindent 4 }}'] = None
-        metadata['labels']['{{- end }}'] = None
+        # Common labels from values - remove this as it creates invalid YAML
+        # Instead, we'll handle this in a post-processing step
         
         # Annotations templating
         if 'annotations' not in metadata:
             metadata['annotations'] = {}
         
-        # Common annotations from values
-        metadata['annotations']['{{- with .Values.commonAnnotations }}'] = None
-        metadata['annotations']['{{- toYaml . | nindent 4 }}'] = None
-        metadata['annotations']['{{- end }}'] = None
+        # Common annotations from values - remove this as it creates invalid YAML
+        # Instead, we'll handle this in a post-processing step
     
     def _apply_field_templating(self, resource: Dict[str, Any], extracted_values: Dict[str, Any]) -> None:
         """Apply field-specific templating based on resource kind."""

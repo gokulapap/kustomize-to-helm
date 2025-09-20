@@ -339,9 +339,12 @@ class MultiOverlayMigrator:
 #
 """
         
+        # Process values to handle multiline strings properly
+        processed_values = self._process_values_for_yaml(values)
+        
         with open(file_path, 'w') as f:
             f.write(header_comment)
-            self._write_yaml_with_literal_blocks(f, values)
+            yaml.dump(processed_values, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     
     def _process_values_for_yaml(self, values: Dict[str, Any]) -> Dict[str, Any]:
         """Process values to ensure proper YAML formatting for multi-line strings."""
@@ -367,39 +370,6 @@ class MultiOverlayMigrator:
     
     def _write_yaml_with_literal_blocks(self, file_obj, data, indent=0):
         """Write YAML with proper literal block formatting for ConfigMap data."""
+        # This method is deprecated - we now use yaml.dump directly in _write_overlay_values_file
         import yaml
-        
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, dict):
-                    file_obj.write('  ' * indent + f'{key}:\n')
-                    self._write_yaml_with_literal_blocks(file_obj, value, indent + 1)
-                elif isinstance(value, list):
-                    file_obj.write('  ' * indent + f'{key}:\n')
-                    for item in value:
-                        if isinstance(item, (dict, list)):
-                            file_obj.write('  ' * (indent + 1) + '- ')
-                            self._write_yaml_with_literal_blocks(file_obj, item, indent + 2)
-                        else:
-                            file_obj.write('  ' * (indent + 1) + f'- {yaml.dump(item).strip()}\n')
-                elif isinstance(value, str) and '\n' in value and len(value.split('\n')) > 2:
-                    # Use literal block format for multiline strings
-                    file_obj.write('  ' * indent + f'{key}: |-\n')
-                    for line in value.split('\n'):
-                        if line.strip():  # Skip empty lines at the end
-                            file_obj.write('  ' * (indent + 1) + line + '\n')
-                        else:
-                            file_obj.write('\n')
-                else:
-                    # Use standard YAML formatting for other values
-                    file_obj.write('  ' * indent + f'{key}: {yaml.dump(value).strip()}\n')
-        elif isinstance(data, list):
-            for item in data:
-                file_obj.write('  ' * indent + '- ')
-                if isinstance(item, (dict, list)):
-                    file_obj.write('\n')
-                    self._write_yaml_with_literal_blocks(file_obj, item, indent + 1)
-                else:
-                    file_obj.write(f'{yaml.dump(item).strip()}\n')
-        else:
-            file_obj.write(f'{yaml.dump(data).strip()}\n')
+        yaml.dump(data, file_obj, default_flow_style=False, allow_unicode=True, sort_keys=False)
