@@ -41,6 +41,8 @@ k2h migrate [OPTIONS] KUSTOMIZE_DIR OUTPUT_DIR
 
 **Options:**
 - `--chart-name, -n TEXT`: Name for the Helm chart (defaults to directory name)
+- `--base-dir, -b DIRECTORY`: Base directory path (for multi-overlay setups)
+- `--overlays-dir, -o DIRECTORY`: Overlays directory path (for multi-overlay setups)
 - `--dry-run`: Analyze without creating files
 - `--force`: Overwrite existing chart directory
 - `--output-format, -f [json|yaml|text]`: Output format for migration report (default: text)
@@ -53,6 +55,9 @@ k2h migrate ./my-kustomize-app ./helm-charts
 # Custom chart name
 k2h migrate ./my-app ./charts --chart-name production-app
 
+# Multi-overlay migration
+k2h migrate ./base ./helm-charts --base-dir ./base --overlays-dir ./overlays --chart-name my-app
+
 # Dry run
 k2h migrate ./my-app ./charts --dry-run
 
@@ -61,6 +66,45 @@ k2h migrate ./my-app ./charts --force
 
 # JSON output
 k2h migrate ./my-app ./charts --output-format json
+```
+
+### Multi-Overlay Migration
+
+For Kustomize configurations with base + overlays structure:
+
+```bash
+k2h migrate [OPTIONS] KUSTOMIZE_DIR OUTPUT_DIR --base-dir BASE_DIR --overlays-dir OVERLAYS_DIR
+```
+
+**Multi-Overlay Arguments:**
+- `KUSTOMIZE_DIR`: Path to base directory (used as fallback)
+- `OUTPUT_DIR`: Directory where Helm chart will be created
+- `--base-dir, -b`: Base directory path containing base kustomization.yaml
+- `--overlays-dir, -o`: Overlays directory containing environment-specific overlays
+
+**Multi-Overlay Examples:**
+```bash
+# Migrate base + overlays
+k2h migrate ./base ./charts --base-dir ./base --overlays-dir ./overlays --chart-name webapp
+
+# With verbose output
+k2h migrate ./base ./charts --base-dir ./base --overlays-dir ./overlays --chart-name webapp --verbose
+
+# Dry run for multi-overlay
+k2h migrate ./base ./charts --base-dir ./base --overlays-dir ./overlays --chart-name webapp --dry-run
+```
+
+**Generated Output:**
+```
+charts/webapp/
+├── Chart.yaml
+├── values.yaml              # Base values
+├── values-dev.yaml          # Development overlay values
+├── values-prod.yaml         # Production overlay values
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    └── configmap.yaml
 ```
 
 ### `k2h analyze`

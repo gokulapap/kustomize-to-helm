@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name="kustomize-to-helm",
     version="1.0.0",
-    description="A framework to migrate Kustomize configurations to Helm charts",
+    description="Automated migration tool that converts Kustomize configurations to production-ready Helm charts with multi-overlay support",
     author="Migration Framework",
     packages=find_packages(),
     install_requires=[

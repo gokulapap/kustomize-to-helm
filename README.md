@@ -5,6 +5,7 @@ A comprehensive Python framework for migrating Kustomize configurations to Helm 
 ## Features
 
 - 🔄 **Complete Migration**: Converts Kustomize configurations to fully functional Helm charts
+- 🌐 **Multi-Overlay Support**: Migrate base + overlays configurations with environment-specific values
 - 📊 **Analysis Mode**: Analyze Kustomize configurations before migration
 - 🎛️ **Template Conversion**: Advanced templating with proper Helm patterns
 - 🔧 **Value Extraction**: Automatic extraction of configurable values
@@ -12,6 +13,7 @@ A comprehensive Python framework for migrating Kustomize configurations to Helm 
 - 🔍 **Patch Processing**: Converts Kustomize patches to Helm templates
 - 🛡️ **Validation**: Built-in validation for generated Helm charts
 - 🖥️ **CLI Interface**: Easy-to-use command-line interface
+- ✨ **Production Ready**: Generates clean, valid YAML with proper Helm templating
 
 ## Installation
 
@@ -40,6 +42,16 @@ k2h migrate /path/to/kustomize/dir /path/to/output/dir --chart-name my-app
 
 # Dry run (analyze without creating files)
 k2h migrate /path/to/kustomize/dir /path/to/output/dir --dry-run
+```
+
+### Multi-Overlay Migration
+
+```bash
+# Migrate base + overlays configuration
+k2h migrate /path/to/base /path/to/output --base-dir /path/to/base --overlays-dir /path/to/overlays --chart-name my-app
+
+# Example: Migrate with dev and prod overlays
+k2h migrate ./base ./helm-charts --base-dir ./base --overlays-dir ./overlays --chart-name webapp
 ```
 
 ### Analysis
@@ -128,7 +140,54 @@ k2h analyze ./my-app-kustomize
 k2h migrate ./my-app-kustomize ./charts --chart-name my-production-app
 ```
 
-### Example 3: Using the Python API
+### Example 3: Multi-Overlay Migration
+
+Given a Kustomize directory structure:
+```
+my-app/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   └── service.yaml
+└── overlays/
+    ├── dev/
+    │   ├── kustomization.yaml
+    │   └── deployment-patch.yaml
+    └── prod/
+        ├── kustomization.yaml
+        ├── deployment-patch.yaml
+        └── ingress.yaml
+```
+
+Multi-overlay migration:
+```bash
+# Migrate with all overlays
+k2h migrate ./base ./charts --base-dir ./base --overlays-dir ./overlays --chart-name my-app
+```
+
+Generated Helm chart:
+```
+charts/my-app/
+├── Chart.yaml
+├── values.yaml              # Base values
+├── values-dev.yaml          # Development values
+├── values-prod.yaml         # Production values
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    └── ingress.yaml
+```
+
+Deploy with environment-specific values:
+```bash
+# Deploy to development
+helm install my-app-dev ./charts/my-app -f ./charts/my-app/values-dev.yaml
+
+# Deploy to production
+helm install my-app-prod ./charts/my-app -f ./charts/my-app/values-prod.yaml
+```
+
+### Example 4: Using the Python API
 
 ```python
 from kustomize_to_helm import KustomizeToHelmMigrator
@@ -241,6 +300,8 @@ commonAnnotations: {}
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--chart-name` | Name for the Helm chart | Directory name |
+| `--base-dir` | Base directory path (for multi-overlay setups) | None |
+| `--overlays-dir` | Overlays directory path (for multi-overlay setups) | None |
 | `--dry-run` | Analyze without creating files | False |
 | `--force` | Overwrite existing chart directory | False |
 | `--output-format` | Output format (json/yaml/text) | text |
@@ -335,7 +396,19 @@ migrator.converter.extract_parameterizable_values = custom_extract_values
    ```
    Solution: Check that all resources listed in `kustomization.yaml` exist and paths are correct.
 
-3. **Complex patches**
+3. **Multi-overlay migration issues**
+   ```
+   Error: No such option: --base-dir
+   ```
+   Solution: Ensure you're using the latest version. Multi-overlay support requires version 1.0.0+.
+
+4. **Invalid YAML in generated files**
+   ```
+   Error: parse error at (webapp/templates/service.yaml:6): unexpected {{end}}
+   ```
+   Solution: This has been fixed in version 1.0.0+. Update to the latest version.
+
+5. **Complex patches**
    ```
    Warning: JSON6902 patches require manual conversion to Helm templates
    ```
@@ -391,3 +464,9 @@ For issues and questions:
 - CLI interface
 - Analysis and validation tools
 - Support for major Kubernetes resource types
+- **Multi-overlay support** with `--base-dir` and `--overlays-dir` options
+- **Environment-specific values files** generation
+- **Fixed YAML generation** - removed invalid `...` syntax
+- **Fixed template generation** - removed invalid `{{- end }}: null` syntax
+- **Production-ready output** with clean, valid Helm templates
+- **Comprehensive testing** with real-world multi-overlay scenarios
