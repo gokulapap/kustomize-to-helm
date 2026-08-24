@@ -1,472 +1,173 @@
-# Kustomize to Helm Migration Framework
+# kustomize-to-helm
 
-A comprehensive Python framework for migrating Kustomize configurations to Helm charts. This tool automates the conversion process while preserving the functionality and structure of your Kubernetes deployments.
+`kustomize-to-helm` (`k2h`) is a fidelity-first migration framework that turns a
+Kustomize base—or a base plus all of its overlays—into a Helm chart and proves
+that Helm renders the same Kubernetes resources.
 
-## Features
+The important design choice is simple: **Kustomize renders the source of truth**.
+The framework does not attempt to reimplement strategic merge patches, JSON
+patches, transformers, name references, generator hashes, image rewrites, or CRD
+semantics in Python. It asks Kustomize for the final manifests, creates a
+values-driven Helm resource catalog, runs `helm lint`, renders the chart, and
+compares every resource to the Kustomize output before replacing the destination.
 
-- 🔄 **Complete Migration**: Converts Kustomize configurations to fully functional Helm charts
-- 🌐 **Multi-Overlay Support**: Migrate base + overlays configurations with environment-specific values
-- 📊 **Analysis Mode**: Analyze Kustomize configurations before migration
-- 🎛️ **Template Conversion**: Advanced templating with proper Helm patterns
-- 🔧 **Value Extraction**: Automatic extraction of configurable values
-- 📦 **Resource Support**: Handles Deployments, Services, Ingress, ConfigMaps, Secrets, and more
-- 🔍 **Patch Processing**: Converts Kustomize patches to Helm templates
-- 🛡️ **Validation**: Built-in validation for generated Helm charts
-- 🖥️ **CLI Interface**: Easy-to-use command-line interface
-- ✨ **Production Ready**: Generates clean, valid YAML with proper Helm templating
+## What it handles
 
-## Installation
+- Strategic merge, JSON 6902, and unified `patches`
+- Name prefixes/suffixes, namespaces, labels, annotations, images, and replicas
+- ConfigMap and Secret generators, including file/env inputs and hash suffixes
+- Multiple containers, ports, arbitrary custom resources, and multi-document YAML
+- Overlay-added, overlay-modified, renamed, and overlay-removed resources
+- Literal application content containing `{{ ... }}` without evaluating it as Helm
+- Duplicate YAML keys, broken references, build timeouts, duplicate Kubernetes
+  identities, invalid chart names, missing tools, and unsafe overwrite attempts
+- Transactional `--force`: the old chart stays intact until the replacement passes
+  validation
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd kustomize-to-helm
+## Requirements
 
-# Install dependencies
-pip install -r requirements.txt
+- Python 3.8+
+- [Kustomize](https://kubectl.docs.kubernetes.io/installation/kustomize/) on `PATH`,
+  or `kubectl` with `kubectl kustomize`
+- [Helm 3](https://helm.sh/docs/intro/install/) on `PATH` for the default lint and
+  equivalence verification
 
-# Install the package
-pip install -e .
-```
-
-## Quick Start
-
-### Basic Migration
-
-```bash
-# Migrate a Kustomize configuration to a Helm chart
-k2h migrate /path/to/kustomize/dir /path/to/output/dir
-
-# Migrate with custom chart name
-k2h migrate /path/to/kustomize/dir /path/to/output/dir --chart-name my-app
-
-# Dry run (analyze without creating files)
-k2h migrate /path/to/kustomize/dir /path/to/output/dir --dry-run
-```
-
-### Multi-Overlay Migration
+Install locally:
 
 ```bash
-# Migrate base + overlays configuration
-k2h migrate /path/to/base /path/to/output --base-dir /path/to/base --overlays-dir /path/to/overlays --chart-name my-app
-
-# Example: Migrate with dev and prod overlays
-k2h migrate ./base ./helm-charts --base-dir ./base --overlays-dir ./overlays --chart-name webapp
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+k2h --version
 ```
 
-### Analysis
+## Single configuration
 
 ```bash
-# Analyze Kustomize configuration
-k2h analyze /path/to/kustomize/dir
-
-# Save analysis to file
-k2h analyze /path/to/kustomize/dir --output-file analysis.json --output-format json
+k2h analyze ./kustomize
+k2h migrate ./kustomize ./charts --chart-name my-app
+helm template test ./charts/my-app
 ```
 
-### Chart Validation
+Use `--dry-run` to build and analyze without writing. A pre-existing chart is a
+hard error unless `--force` is supplied. `--force` replaces it transactionally.
 
-```bash
-# Validate generated Helm chart
-k2h validate /path/to/helm/chart
+## Base plus overlays
 
-# Strict validation
-k2h validate /path/to/helm/chart --strict
-```
+Given:
 
-## Usage Examples
-
-### Example 1: Simple Application Migration
-
-Given a Kustomize directory structure:
-```
-my-app/
-├── kustomization.yaml
-├── deployment.yaml
-├── service.yaml
-└── configmap.yaml
-```
-
-Migration command:
-```bash
-k2h migrate my-app ./charts --chart-name my-app
-```
-
-Generated Helm chart:
-```
-charts/my-app/
-├── Chart.yaml
-├── values.yaml
-├── templates/
-│   ├── deployment.yaml
-│   ├── service.yaml
-│   ├── configmap.yaml
-│   ├── _helpers.tpl
-│   └── NOTES.txt
-└── charts/
-```
-
-### Example 2: Complex Migration with Patches
-
-Kustomize configuration with patches:
-```yaml
-# kustomization.yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - base/deployment.yaml
-  - base/service.yaml
-
-patchesStrategicMerge:
-  - patches/deployment-patch.yaml
-
-images:
-  - name: nginx
-    newTag: 1.20
-    
-namespace: production
-namePrefix: prod-
-commonLabels:
-  environment: production
-```
-
-Migration with analysis:
-```bash
-# First analyze the configuration
-k2h analyze ./my-app-kustomize
-
-# Then migrate
-k2h migrate ./my-app-kustomize ./charts --chart-name my-production-app
-```
-
-### Example 3: Multi-Overlay Migration
-
-Given a Kustomize directory structure:
-```
-my-app/
+```text
+app/
 ├── base/
-│   ├── kustomization.yaml
-│   ├── deployment.yaml
-│   └── service.yaml
+│   └── kustomization.yaml
 └── overlays/
-    ├── dev/
-    │   ├── kustomization.yaml
-    │   └── deployment-patch.yaml
-    └── prod/
-        ├── kustomization.yaml
-        ├── deployment-patch.yaml
-        └── ingress.yaml
+    ├── dev/kustomization.yaml
+    └── prod/kustomization.yaml
 ```
 
-Multi-overlay migration:
+Run:
+
 ```bash
-# Migrate with all overlays
-k2h migrate ./base ./charts --base-dir ./base --overlays-dir ./overlays --chart-name my-app
+k2h migrate ./app/base ./charts \
+  --overlays-dir ./app/overlays \
+  --chart-name my-app
 ```
 
-Generated Helm chart:
-```
-charts/my-app/
-├── Chart.yaml
-├── values.yaml              # Base values
-├── values-dev.yaml          # Development values
-├── values-prod.yaml         # Production values
-└── templates/
-    ├── deployment.yaml
-    ├── service.yaml
-    └── ingress.yaml
-```
+This creates `values.yaml`, `values-dev.yaml`, and `values-prod.yaml`. Each file is
+verified against its corresponding Kustomize build:
 
-Deploy with environment-specific values:
 ```bash
-# Deploy to development
-helm install my-app-dev ./charts/my-app -f ./charts/my-app/values-dev.yaml
-
-# Deploy to production
-helm install my-app-prod ./charts/my-app -f ./charts/my-app/values-prod.yaml
+helm template test ./charts/my-app -f ./charts/my-app/values-dev.yaml
 ```
 
-### Example 4: Using the Python API
+Every immediate, non-hidden directory below `--overlays-dir` is treated as an
+overlay. A broken overlay fails the complete migration; it is never silently
+skipped.
+
+## Generated chart model
+
+`values.yaml` contains a stable key for each Kubernetes identity:
+
+```yaml
+resources:
+  deployment-default-api-2f89d8c1a0:
+    enabled: true
+    manifest: |
+      apiVersion: apps/v1
+      kind: Deployment
+      # ...complete rendered resource...
+```
+
+Overlay values explicitly enable or disable every catalogued resource, so even
+stacked values files are deterministic. They replace the complete manifest string
+only for changed resources. Storing changed manifests as strings is intentional:
+Helm's normal deep map merge cannot represent field deletion faithfully.
+
+This model prioritizes safe migration over guessing which fields should become a
+shared value. After equivalence is established, teams can refactor selected
+manifest fields into conventional Helm values under normal review and testing.
+
+## Validation and machine-readable reports
+
+```bash
+k2h validate ./charts/my-app --strict
+k2h migrate ./kustomize ./charts -f json
+k2h analyze ./kustomize -f yaml -o analysis.yaml
+```
+
+JSON and YAML modes write only the report to stdout; logs and warnings go to
+stderr. Migration validation compares parsed Kubernetes objects by
+`apiVersion`, `kind`, namespace, and name, then compares their complete content.
+
+## Python API
 
 ```python
 from kustomize_to_helm import KustomizeToHelmMigrator
 
-# Initialize migrator
 migrator = KustomizeToHelmMigrator(
-    kustomize_dir="/path/to/kustomize",
-    output_dir="/path/to/output",
-    chart_name="my-app"
-)
-
-# Perform migration
-report = migrator.migrate()
-print(f"Migration status: {report['status']}")
-print(f"Resources migrated: {report['resources_migrated']}")
-
-# Or just analyze
-analysis = migrator.analyze_only()
-print(f"Migration complexity: {analysis['migration_complexity']}")
-```
-
-## Supported Kustomize Features
-
-### ✅ Fully Supported
-- Resources (YAML files and directories)
-- Strategic merge patches
-- Namespace transformation
-- Name prefix/suffix
-- Common labels and annotations
-- Image transformations (name, tag, digest)
-- Replica transformations
-- ConfigMap generators
-- Secret generators
-
-### ⚠️ Partially Supported
-- JSON6902 patches (converted to comments/manual review needed)
-- Complex transformers (require manual handling)
-
-### ❌ Not Supported
-- Custom plugins
-- Remote resources (URLs)
-- Helm charts as resources
-
-## Generated Helm Chart Structure
-
-The migration tool generates a complete Helm chart with the following structure:
-
-```
-chart-name/
-├── Chart.yaml              # Chart metadata
-├── values.yaml             # Default configuration values
-├── templates/
-│   ├── deployment.yaml     # Deployment template
-│   ├── service.yaml        # Service template
-│   ├── ingress.yaml        # Ingress template (if present)
-│   ├── configmap.yaml      # ConfigMap template
-│   ├── secret.yaml         # Secret template
-│   ├── serviceaccount.yaml # ServiceAccount template
-│   ├── _helpers.tpl        # Template helpers
-│   ├── NOTES.txt          # Installation notes
-│   └── tests/
-│       └── test-connection.yaml
-└── charts/                 # Dependencies (empty)
-```
-
-### Values.yaml Structure
-
-The generated `values.yaml` includes:
-
-```yaml
-# Replica configuration
-replicaCount: 1
-
-# Image configuration
-image:
-  repository: nginx
-  pullPolicy: IfNotPresent
-  tag: "1.20"
-
-# Service configuration
-service:
-  type: ClusterIP
-  port: 80
-
-# Ingress configuration
-ingress:
-  enabled: false
-  className: ""
-  annotations: {}
-  hosts: []
-  tls: []
-
-# Resource limits
-resources: {}
-
-# Node selection
-nodeSelector: {}
-tolerations: []
-affinity: {}
-
-# Common labels and annotations
-commonLabels: {}
-commonAnnotations: {}
-```
-
-## Configuration Options
-
-### CLI Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--chart-name` | Name for the Helm chart | Directory name |
-| `--base-dir` | Base directory path (for multi-overlay setups) | None |
-| `--overlays-dir` | Overlays directory path (for multi-overlay setups) | None |
-| `--dry-run` | Analyze without creating files | False |
-| `--force` | Overwrite existing chart directory | False |
-| `--output-format` | Output format (json/yaml/text) | text |
-| `--verbose` | Enable verbose logging | False |
-
-### Migration Options
-
-The migration process can be customized by modifying the migrator configuration:
-
-```python
-migrator = KustomizeToHelmMigrator(
-    kustomize_dir="/path/to/kustomize",
-    output_dir="/path/to/output",
+    kustomize_dir="./kustomize",
+    output_dir="./charts",
     chart_name="my-app",
-    dry_run=False  # Set to True for analysis only
+    overwrite=False,
+    verify=True,
 )
-
-# Customize chart metadata
-migrator.generator.chart_metadata.update({
-    'description': 'My custom application',
-    'version': '1.0.0',
-    'appVersion': '2.0.0'
-})
-
-# Customize values
-migrator.generator.values.update({
-    'replicaCount': 3,
-    'image': {
-        'repository': 'my-registry/my-app',
-        'tag': 'v2.0.0'
-    }
-})
-
-# Perform migration
 report = migrator.migrate()
 ```
 
-## Advanced Features
+For custom Kustomize flags, pass a command prefix through the API, for example
+`build_command=["kustomize", "build", "--enable-helm"]`. The source directory is
+appended by the framework. Alpha/exec plugins are not enabled automatically
+because they may execute code.
 
-### Custom Template Conversion
+## Security and limitations
 
-Extend the template converter for custom resource types:
+- Rendered Secrets are necessarily copied into chart values. Treat the output as
+  sensitive and use an external secret system before committing when appropriate.
+- Remote Kustomize resources require network access and remain subject to upstream
+  availability and pinning. Pin remote references for reproducible migrations.
+- Verification proves local rendered-object equivalence. It does not reproduce API
+  server defaulting, admission webhooks, cluster capabilities, or live-state drift.
+- Resources using `metadata.generateName` are accepted with a warning because they
+  are not upgrade-stable in Helm.
+- Source `helm.sh/hook` and `helm.sh/resource-policy` annotations block migration:
+  they are inert under Kustomize but change lifecycle behavior under Helm, so they
+  require an explicit manual redesign instead of a misleading equivalence result.
+- Helm verification may be skipped only when `--no-verify` is explicit. The
+  skipped check is prominently recorded in the report.
 
-```python
-from kustomize_to_helm.template_converter import TemplateConverter
-
-class CustomTemplateConverter(TemplateConverter):
-    def _apply_custom_templating(self, resource):
-        # Add custom templating logic
-        if resource.get('kind') == 'CustomResource':
-            # Handle custom resource templating
-            pass
-
-# Use custom converter
-migrator = KustomizeToHelmMigrator(...)
-migrator.converter = CustomTemplateConverter(migrator.chart_name)
-```
-
-### Value Extraction Customization
-
-Customize value extraction for specific patterns:
-
-```python
-# Override value extraction
-def custom_extract_values(self, resources):
-    extracted = super().extract_parameterizable_values(resources)
-    
-    # Add custom value extraction logic
-    for resource in resources:
-        if resource.get('kind') == 'MyCustomResource':
-            extracted['myCustomConfig'] = resource.get('spec', {}).get('config', {})
-    
-    return extracted
-
-# Apply to migrator
-migrator.converter.extract_parameterizable_values = custom_extract_values
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Missing kustomization.yaml**
-   ```
-   Error: No kustomization file found in /path/to/dir
-   ```
-   Solution: Ensure the directory contains a valid `kustomization.yaml`, `kustomization.yml`, or `Kustomization` file.
-
-2. **Resource files not found**
-   ```
-   Warning: Resource file not found: deployment.yaml
-   ```
-   Solution: Check that all resources listed in `kustomization.yaml` exist and paths are correct.
-
-3. **Multi-overlay migration issues**
-   ```
-   Error: No such option: --base-dir
-   ```
-   Solution: Ensure you're using the latest version. Multi-overlay support requires version 1.0.0+.
-
-4. **Invalid YAML in generated files**
-   ```
-   Error: parse error at (webapp/templates/service.yaml:6): unexpected {{end}}
-   ```
-   Solution: This has been fixed in version 1.0.0+. Update to the latest version.
-
-5. **Complex patches**
-   ```
-   Warning: JSON6902 patches require manual conversion to Helm templates
-   ```
-   Solution: Review generated chart and manually convert complex patches to Helm template logic.
-
-### Debug Mode
-
-Enable verbose logging for detailed information:
+## Development
 
 ```bash
-k2h --verbose migrate /path/to/kustomize /path/to/output
+python -m unittest discover -s tests -v
+python -m compileall -q kustomize_to_helm
+ruff check .
 ```
 
-### Validation Errors
-
-If the generated chart has validation errors:
-
-```bash
-# Validate the chart
-k2h validate /path/to/generated/chart
-
-# Check Helm lint
-helm lint /path/to/generated/chart
-
-# Test installation (dry-run)
-helm install --dry-run --debug my-release /path/to/generated/chart
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Support
-
-For issues and questions:
-- Create an issue on GitHub
-- Check existing documentation
-- Review the examples directory
-
-## Changelog
-
-### v1.0.0
-- Initial release
-- Complete Kustomize to Helm migration
-- CLI interface
-- Analysis and validation tools
-- Support for major Kubernetes resource types
-- **Multi-overlay support** with `--base-dir` and `--overlays-dir` options
-- **Environment-specific values files** generation
-- **Fixed YAML generation** - removed invalid `...` syntax
-- **Fixed template generation** - removed invalid `{{- end }}: null` syntax
-- **Production-ready output** with clean, valid Helm templates
-- **Comprehensive testing** with real-world multi-overlay scenarios
+The critical integration fixture covers RBAC name references, generated
+ConfigMaps/Secrets and hashes, replacements, strategic and JSON patches, field and
+resource deletion, image digests with registry ports, multiple containers,
+StatefulSets and PVC templates, HPA/PDB/NetworkPolicy, Ingress and Gateway API,
+CRDs and arbitrary custom resources, components, multiline data, and literal Helm
+tokens. Both production and canary overlays—as well as stacked values files—must
+render identically to Kustomize. Integration tests automatically skip when
+Kustomize or Helm is unavailable.

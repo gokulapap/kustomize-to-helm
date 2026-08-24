@@ -1,618 +1,353 @@
-"""
-Helm Chart Generator Module
+"""Transactional, fidelity-first Helm chart generation."""
 
-Generates Helm charts from parsed Kustomize configurations.
-"""
-
-import os
-import yaml
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Union
-from jinja2 import Environment, BaseLoader
+import copy
+import hashlib
 import logging
+import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Union
+
+import yaml
+
+from .errors import ConfigurationError, GenerationError
+from .resources import identity_text, index_resources, resource_key
 
 logger = logging.getLogger(__name__)
 
+_CHART_NAME_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+_SEMVER_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+
+
+class _LiteralString(str):
+    pass
+
+
+class _ValuesDumper(yaml.SafeDumper):
+    def ignore_aliases(self, data):
+        return True
+
+
+def _represent_literal(dumper: yaml.SafeDumper, data: _LiteralString):
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+
+
+_ValuesDumper.add_representer(_LiteralString, _represent_literal)
+
+
+def validate_chart_name(name: str) -> str:
+    """Validate a Helm chart name and return it unchanged."""
+    if not isinstance(name, str) or not name:
+        raise ConfigurationError("Chart name must be a non-empty string")
+    if len(name) > 253 or not _CHART_NAME_RE.fullmatch(name):
+        raise ConfigurationError(
+            f"Invalid chart name {name!r}. Use lowercase letters, numbers, or '-', "
+            "starting and ending with a letter or number (maximum 253 characters)."
+        )
+    return name
+
+
+def normalize_chart_name(name: str) -> str:
+    """Convert a directory name to a valid, predictable Helm chart name."""
+    normalized = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    normalized = re.sub(r"-{2,}", "-", normalized)[:253].rstrip("-")
+    if not normalized:
+        raise ConfigurationError(f"Cannot derive a valid chart name from {name!r}")
+    return validate_chart_name(normalized)
+
+
+def validate_chart_version(version: str) -> str:
+    """Validate the SemVer required by Helm's Chart.yaml version field."""
+    if not isinstance(version, str) or not _SEMVER_RE.fullmatch(version):
+        raise ConfigurationError(f"Invalid chart version {version!r}; expected semantic versioning")
+    return version
+
 
 class HelmChartGenerator:
-    """Generator for Helm charts from Kustomize configurations."""
-    
-    def __init__(self, chart_name: str, output_dir: Union[str, Path]):
-        """
-        Initialize the Helm chart generator.
-        
-        Args:
-            chart_name: Name of the Helm chart
-            output_dir: Directory where the Helm chart will be created
-        """
-        self.chart_name = chart_name
-        self.output_dir = Path(output_dir)
-        self.chart_dir = self.output_dir / chart_name
+    """Generate a values-driven chart whose output matches Kustomize exactly."""
+
+    def __init__(
+        self,
+        chart_name: str,
+        output_dir: Union[str, Path],
+        overwrite: bool = False,
+    ):
+        self.chart_name = validate_chart_name(chart_name)
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.chart_dir = self.output_dir / self.chart_name
         self.templates_dir = self.chart_dir / "templates"
-        
-        # Initialize chart metadata
-        self.chart_metadata = {
-            'apiVersion': 'v2',
-            'name': chart_name,
-            'description': f'Helm chart for {chart_name} (migrated from Kustomize)',
-            'type': 'application',
-            'version': '0.1.0',
-            'appVersion': '1.0.0'
+        self.overwrite = overwrite
+        self.values: Dict[str, Any] = {}
+        self.chart_metadata: Dict[str, Any] = {
+            "apiVersion": "v2",
+            "name": self.chart_name,
+            "description": f"Helm chart for {self.chart_name} (migrated from Kustomize)",
+            "type": "application",
+            "version": "0.1.0",
+            "appVersion": "1.0.0",
         }
-        
-        # Initialize values
-        self.values = {
-            'replicaCount': 1,
-            'image': {
-                'repository': 'nginx',
-                'pullPolicy': 'IfNotPresent',
-                'tag': 'latest'
-            },
-            'nameOverride': '',
-            'fullnameOverride': '',
-            'serviceAccount': {
-                'create': True,
-                'annotations': {},
-                'name': ''
-            },
-            'podAnnotations': {},
-            'podSecurityContext': {},
-            'securityContext': {},
-            'service': {
-                'type': 'ClusterIP',
-                'port': 80
-            },
-            'ingress': {
-                'enabled': False,
-                'className': '',
-                'annotations': {},
-                'hosts': [],
-                'tls': []
-            },
-            'resources': {},
-            'autoscaling': {
-                'enabled': False,
-                'minReplicas': 1,
-                'maxReplicas': 100,
-                'targetCPUUtilizationPercentage': 80
-            },
-            'nodeSelector': {},
-            'tolerations': [],
-            'affinity': {}
-        }
-        
-        # Template environment
-        self.jinja_env = Environment(loader=BaseLoader())
-    
-    def generate_chart(self, kustomize_data: Dict[str, Any]) -> None:
+        self.generated_values_files: List[str] = []
+
+    def generate_chart(
+        self,
+        kustomize_data: Dict[str, Any],
+        overlay_resources: Optional[Mapping[str, List[Dict[str, Any]]]] = None,
+        pre_install_validator: Optional[Callable[[Path], None]] = None,
+    ) -> None:
+        """Generate the chart atomically.
+
+        ``overlay_resources`` maps overlay names to their fully rendered resource
+        sets. The base rendered set is supplied in ``kustomize_data['resources']``.
         """
-        Generate a complete Helm chart from Kustomize data.
-        
-        Args:
-            kustomize_data: Parsed Kustomize configuration data
-        """
-        logger.info(f"Generating Helm chart: {self.chart_name}")
-        
-        # Create chart directory structure
-        self._create_chart_structure()
-        
-        # Update chart metadata from kustomize data
-        self._update_chart_metadata(kustomize_data)
-        
-        # Extract values from kustomize configuration
-        self._extract_values(kustomize_data)
-        
-        # Generate templates
-        self._generate_templates(kustomize_data)
-        
-        # Write Chart.yaml
-        self._write_chart_yaml()
-        
-        # Write values.yaml
-        self._write_values_yaml()
-        
-        # Write helper templates
-        self._write_helpers_template()
-        
-        logger.info(f"Helm chart generated successfully at: {self.chart_dir}")
-    
-    def _create_chart_structure(self) -> None:
-        """Create the basic Helm chart directory structure."""
-        directories = [
-            self.chart_dir,
-            self.templates_dir,
-            self.chart_dir / "charts"
+        base_resources = kustomize_data.get("resources")
+        if not isinstance(base_resources, list):
+            raise GenerationError("kustomize_data['resources'] must be a list")
+        overlays = dict(overlay_resources or {})
+        for name, resources in overlays.items():
+            if not isinstance(name, str) or not name:
+                raise ConfigurationError(f"Invalid overlay name: {name!r}")
+            if not isinstance(resources, list):
+                raise GenerationError(f"Resources for overlay {name!r} must be a list")
+
+        base_index = index_resources(base_resources)
+        overlay_indexes = {name: index_resources(resources) for name, resources in overlays.items()}
+        catalog, overlay_values = self._build_resource_values(base_index, overlay_indexes)
+        self.values = {"resources": catalog}
+        self.chart_metadata["appVersion"] = "1.0.0"
+        self._update_chart_metadata(kustomize_data, base_resources)
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if not self.output_dir.is_dir():
+            raise GenerationError(f"Output path is not a directory: {self.output_dir}")
+        if self.chart_dir.is_symlink():
+            raise GenerationError(
+                f"Refusing to replace symlinked chart directory: {self.chart_dir}"
+            )
+        if self.chart_dir.exists() and not self.overwrite:
+            raise GenerationError(
+                f"Chart directory already exists: {self.chart_dir}. "
+                "Use overwrite/--force explicitly."
+            )
+
+        staging_root = Path(tempfile.mkdtemp(prefix=".k2h-stage-", dir=str(self.output_dir)))
+        staged_chart = staging_root / self.chart_name
+        try:
+            self._write_chart(staged_chart, overlay_values)
+            if pre_install_validator:
+                pre_install_validator(staged_chart)
+            self._install_staged_chart(staged_chart)
+        except Exception:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
+        shutil.rmtree(staging_root, ignore_errors=True)
+        self.templates_dir = self.chart_dir / "templates"
+        logger.info("Generated Helm chart at %s", self.chart_dir)
+
+    def _build_resource_values(self, base_index, overlay_indexes):
+        all_identities = set(base_index)
+        for overlay_index in overlay_indexes.values():
+            all_identities.update(overlay_index)
+
+        representatives = dict(base_index)
+        for overlay_name in sorted(overlay_indexes):
+            for identity, resource in overlay_indexes[overlay_name].items():
+                representatives.setdefault(identity, resource)
+
+        catalog: Dict[str, Dict[str, Any]] = {}
+        key_by_identity = {}
+        for identity in sorted(all_identities):
+            resource = representatives[identity]
+            key = resource_key(resource)
+            if key in catalog:
+                raise GenerationError(
+                    f"Internal resource-key collision for {identity_text(identity)}"
+                )
+            key_by_identity[identity] = key
+            catalog[key] = {
+                "enabled": identity in base_index,
+                "manifest": _LiteralString(self._serialize_resource(resource)),
+            }
+
+        overlay_values: Dict[str, Dict[str, Any]] = {}
+        for overlay_name, overlay_index in sorted(overlay_indexes.items()):
+            changes: Dict[str, Dict[str, Any]] = {}
+            for identity in sorted(all_identities):
+                key = key_by_identity[identity]
+                in_overlay = identity in overlay_index
+                changes[key] = {"enabled": in_overlay}
+                if in_overlay and overlay_index[identity] != representatives[identity]:
+                    changes[key]["manifest"] = _LiteralString(
+                        self._serialize_resource(overlay_index[identity])
+                    )
+            overlay_values[overlay_name] = {"resources": changes}
+        return catalog, overlay_values
+
+    @staticmethod
+    def _serialize_resource(resource: Dict[str, Any]) -> str:
+        clean = copy.deepcopy(resource)
+        clean.pop("_source_file", None)
+        return yaml.safe_dump(clean, sort_keys=False, default_flow_style=False).rstrip() + "\n"
+
+    def _update_chart_metadata(self, kustomize_data, resources) -> None:
+        images = kustomize_data.get("kustomization", {}).get("images", [])
+        if images and isinstance(images[0], dict):
+            version = images[0].get("newTag") or images[0].get("digest")
+            if version:
+                self.chart_metadata["appVersion"] = str(version)
+                return
+        for resource in resources:
+            containers = (
+                resource.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+            )
+            if containers and isinstance(containers[0], dict):
+                image = containers[0].get("image", "")
+                if "@" in image:
+                    self.chart_metadata["appVersion"] = image.rsplit("@", 1)[1]
+                    return
+                last_component = image.rsplit("/", 1)[-1]
+                if ":" in last_component:
+                    self.chart_metadata["appVersion"] = last_component.rsplit(":", 1)[1]
+                    return
+
+    def _write_chart(self, chart_dir: Path, overlay_values: Mapping[str, Dict[str, Any]]) -> None:
+        templates_dir = chart_dir / "templates"
+        templates_dir.mkdir(parents=True)
+        (chart_dir / "charts").mkdir()
+        self._write_yaml(chart_dir / "Chart.yaml", self.chart_metadata)
+        self._write_yaml(chart_dir / "values.yaml", self.values)
+        (templates_dir / "resources.yaml").write_text(self._resource_template(), encoding="utf-8")
+        (templates_dir / "NOTES.txt").write_text(self._notes_template(), encoding="utf-8")
+        (chart_dir / ".helmignore").write_text(self._helmignore(), encoding="utf-8")
+        (chart_dir / "MIGRATION.md").write_text(
+            self._migration_notes(overlay_values), encoding="utf-8"
+        )
+
+        self.generated_values_files = ["values.yaml"]
+        used_filenames = {"values.yaml"}
+        for overlay_name, values in sorted(overlay_values.items()):
+            safe_name = self._safe_overlay_filename(overlay_name)
+            filename = f"values-{safe_name}.yaml"
+            filename_key = filename.casefold()
+            if filename_key in {item.casefold() for item in used_filenames}:
+                raise ConfigurationError(
+                    f"Overlay names produce the same values filename: {overlay_name!r}"
+                )
+            used_filenames.add(filename)
+            self._write_yaml(chart_dir / filename, values)
+            self.generated_values_files.append(filename)
+
+    @staticmethod
+    def _write_yaml(path: Path, data: Dict[str, Any]) -> None:
+        try:
+            with path.open("w", encoding="utf-8", newline="\n") as handle:
+                yaml.dump(
+                    data,
+                    handle,
+                    Dumper=_ValuesDumper,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+        except OSError as exc:
+            raise GenerationError(f"Unable to write {path}: {exc}") from exc
+
+    @staticmethod
+    def _safe_overlay_filename(name: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-")
+        if not safe or safe in (".", ".."):
+            raise ConfigurationError(f"Overlay name cannot be used as a values filename: {name!r}")
+        if len(safe.encode("utf-8")) > 180:
+            digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:10]
+            safe = f"{safe[:160].rstrip('.-')}-{digest}"
+        return safe
+
+    def _install_staged_chart(self, staged_chart: Path) -> None:
+        if not self.chart_dir.exists():
+            os.replace(staged_chart, self.chart_dir)
+            return
+
+        backup = Path(tempfile.mkdtemp(prefix=".k2h-backup-", dir=str(self.output_dir)))
+        backup_chart = backup / self.chart_name
+        installed = False
+        try:
+            os.replace(self.chart_dir, backup_chart)
+            try:
+                os.replace(staged_chart, self.chart_dir)
+                installed = True
+            except Exception as install_error:
+                try:
+                    os.replace(backup_chart, self.chart_dir)
+                except Exception as restore_error:
+                    raise GenerationError(
+                        f"Failed to install the new chart and restore the previous chart. "
+                        f"The backup is preserved at {backup_chart}: {restore_error}"
+                    ) from install_error
+                raise
+        finally:
+            if installed or not backup_chart.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+
+    @staticmethod
+    def _resource_template() -> str:
+        return """{{- range $resourceID := keys .Values.resources | sortAlpha }}
+{{- $resource := index $.Values.resources $resourceID }}
+{{- if $resource.enabled }}
+{{- if not $resource.manifest }}
+{{- fail (printf "resources.%s.manifest is required when enabled" $resourceID) }}
+{{- end }}
+{{ $resource.manifest }}---
+{{- end }}
+{{- end }}
+"""
+
+    @staticmethod
+    def _notes_template() -> str:
+        return """Kustomize migration installed {{ len .Values.resources }} catalogued resources.
+Review MIGRATION.md before changing the generated manifest values.
+"""
+
+    @staticmethod
+    def _helmignore() -> str:
+        return """.DS_Store
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.orig
+*~
+"""
+
+    def _migration_notes(self, overlays: Mapping[str, Dict[str, Any]]) -> str:
+        lines = [
+            f"# {self.chart_name} migration notes",
+            "",
+            "This chart was generated from the fully rendered Kustomize output. Each entry in",
+            "`values.yaml` contains one complete Kubernetes manifest, which avoids lossy attempts",
+            "to reinterpret patches or custom resources.",
+            "",
+            "Render the base with:",
+            "",
+            "    helm template RELEASE .",
         ]
-        
-        for directory in directories:
-            directory.mkdir(parents=True, exist_ok=True)
-    
-    def _update_chart_metadata(self, kustomize_data: Dict[str, Any]) -> None:
-        """Update chart metadata based on kustomize configuration."""
-        kustomization = kustomize_data.get('kustomization', {})
-        
-        # Try to extract app version from images
-        images = kustomization.get('images', [])
-        if images and 'newTag' in images[0]:
-            self.chart_metadata['appVersion'] = images[0]['newTag']
-        elif images and 'digest' in images[0]:
-            # Use a portion of the digest as version
-            digest = images[0]['digest'].split(':')[-1][:12]
-            self.chart_metadata['appVersion'] = f"sha-{digest}"
-    
-    def _extract_values(self, kustomize_data: Dict[str, Any]) -> None:
-        """Extract values from kustomize configuration."""
-        kustomization = kustomize_data.get('kustomization', {})
-        resources = kustomize_data.get('resources', [])
-        
-        # Extract from kustomization transformations
-        if 'namespace' in kustomization:
-            self.values['namespace'] = kustomization['namespace']
-        
-        if 'namePrefix' in kustomization:
-            self.values['namePrefix'] = kustomization['namePrefix']
-        
-        if 'nameSuffix' in kustomization:
-            self.values['nameSuffix'] = kustomization['nameSuffix']
-        
-        if 'commonLabels' in kustomization:
-            self.values['commonLabels'] = kustomization['commonLabels']
-        
-        if 'commonAnnotations' in kustomization:
-            self.values['commonAnnotations'] = kustomization['commonAnnotations']
-        
-        # Extract from images
-        images = kustomization.get('images', [])
-        if images:
-            image_config = images[0]  # Use first image as primary
-            if 'name' in image_config:
-                parts = image_config['name'].split('/')
-                self.values['image']['repository'] = '/'.join(parts[:-1]) if len(parts) > 1 else image_config['name']
-            
-            if 'newTag' in image_config:
-                self.values['image']['tag'] = image_config['newTag']
-            elif 'digest' in image_config:
-                self.values['image']['digest'] = image_config['digest']
-        
-        # Extract from replicas
-        replicas = kustomization.get('replicas', [])
-        if replicas:
-            replica_config = replicas[0]  # Use first replica config
-            if 'count' in replica_config:
-                self.values['replicaCount'] = replica_config['count']
-        
-        # Extract values from resources
-        self._extract_values_from_resources(resources)
-    
-    def _extract_values_from_resources(self, resources: List[Dict[str, Any]]) -> None:
-        """Extract values from Kubernetes resources."""
-        for resource in resources:
-            kind = resource.get('kind', '')
-            
-            if kind == 'Deployment':
-                self._extract_deployment_values(resource)
-            elif kind == 'Service':
-                self._extract_service_values(resource)
-            elif kind == 'Ingress':
-                self._extract_ingress_values(resource)
-            elif kind == 'ServiceAccount':
-                self._extract_service_account_values(resource)
-    
-    def _extract_deployment_values(self, deployment: Dict[str, Any]) -> None:
-        """Extract values from Deployment resource."""
-        spec = deployment.get('spec', {})
-        template = spec.get('template', {})
-        pod_spec = template.get('spec', {})
-        
-        # Replica count
-        if 'replicas' in spec:
-            self.values['replicaCount'] = spec['replicas']
-        
-        # Container configuration
-        containers = pod_spec.get('containers', [])
-        if containers:
-            container = containers[0]  # Use first container
-            
-            # Image
-            if 'image' in container:
-                image_parts = container['image'].split(':')
-                if len(image_parts) == 2:
-                    self.values['image']['repository'] = image_parts[0]
-                    self.values['image']['tag'] = image_parts[1]
-                else:
-                    self.values['image']['repository'] = container['image']
-            
-            # Image pull policy
-            if 'imagePullPolicy' in container:
-                self.values['image']['pullPolicy'] = container['imagePullPolicy']
-            
-            # Resources
-            if 'resources' in container:
-                self.values['resources'] = container['resources']
-            
-            # Security context
-            if 'securityContext' in container:
-                self.values['securityContext'] = container['securityContext']
-        
-        # Pod annotations
-        pod_annotations = template.get('metadata', {}).get('annotations', {})
-        if pod_annotations:
-            self.values['podAnnotations'].update(pod_annotations)
-        
-        # Pod security context
-        if 'securityContext' in pod_spec:
-            self.values['podSecurityContext'] = pod_spec['securityContext']
-        
-        # Node selector
-        if 'nodeSelector' in pod_spec:
-            self.values['nodeSelector'] = pod_spec['nodeSelector']
-        
-        # Tolerations
-        if 'tolerations' in pod_spec:
-            self.values['tolerations'] = pod_spec['tolerations']
-        
-        # Affinity
-        if 'affinity' in pod_spec:
-            self.values['affinity'] = pod_spec['affinity']
-    
-    def _extract_service_values(self, service: Dict[str, Any]) -> None:
-        """Extract values from Service resource."""
-        spec = service.get('spec', {})
-        
-        if 'type' in spec:
-            self.values['service']['type'] = spec['type']
-        
-        ports = spec.get('ports', [])
-        if ports:
-            port = ports[0]  # Use first port
-            if 'port' in port:
-                self.values['service']['port'] = port['port']
-    
-    def _extract_ingress_values(self, ingress: Dict[str, Any]) -> None:
-        """Extract values from Ingress resource."""
-        self.values['ingress']['enabled'] = True
-        
-        metadata = ingress.get('metadata', {})
-        annotations = metadata.get('annotations', {})
-        if annotations:
-            self.values['ingress']['annotations'] = annotations
-        
-        spec = ingress.get('spec', {})
-        if 'ingressClassName' in spec:
-            self.values['ingress']['className'] = spec['ingressClassName']
-        
-        rules = spec.get('rules', [])
-        if rules:
-            hosts = []
-            for rule in rules:
-                if 'host' in rule:
-                    hosts.append({'host': rule['host'], 'paths': []})
-            self.values['ingress']['hosts'] = hosts
-        
-        if 'tls' in spec:
-            self.values['ingress']['tls'] = spec['tls']
-    
-    def _extract_service_account_values(self, service_account: Dict[str, Any]) -> None:
-        """Extract values from ServiceAccount resource."""
-        self.values['serviceAccount']['create'] = True
-        
-        metadata = service_account.get('metadata', {})
-        if 'name' in metadata:
-            self.values['serviceAccount']['name'] = metadata['name']
-        
-        annotations = metadata.get('annotations', {})
-        if annotations:
-            self.values['serviceAccount']['annotations'] = annotations
-    
-    def _generate_templates(self, kustomize_data: Dict[str, Any]) -> None:
-        """Generate Helm templates from Kustomize resources."""
-        resources = kustomize_data.get('resources', [])
-        
-        # Group resources by kind
-        resource_groups = {}
-        for resource in resources:
-            kind = resource.get('kind', 'Unknown')
-            if kind not in resource_groups:
-                resource_groups[kind] = []
-            resource_groups[kind].append(resource)
-        
-        # Generate template for each resource type
-        for kind, resource_list in resource_groups.items():
-            self._generate_resource_template(kind, resource_list)
-    
-    def _generate_resource_template(self, kind: str, resources: List[Dict[str, Any]]) -> None:
-        """Generate a Helm template for a specific resource kind."""
-        template_name = f"{kind.lower()}.yaml"
-        template_path = self.templates_dir / template_name
-        
-        template_content = []
-        
-        for i, resource in enumerate(resources):
-            if i > 0:
-                template_content.append("---")
-            
-            # Convert resource to Helm template
-            helm_resource = self._convert_resource_to_template(resource)
-            # Post-process to add proper Helm templating
-            processed_yaml = self._post_process_template_yaml(helm_resource)
-            template_content.append(processed_yaml)
-        
-        # Write template file
-        with open(template_path, 'w') as f:
-            f.write('\n'.join(template_content))
-        
-        logger.info(f"Generated template: {template_name}")
-    
-    def _convert_resource_to_template(self, resource: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert a Kubernetes resource to a Helm template."""
-        # Create a copy of the resource
-        template_resource = yaml.safe_load(yaml.dump(resource))
-        
-        # Remove source file metadata
-        if '_source_file' in template_resource:
-            del template_resource['_source_file']
-        
-        # Apply templating transformations
-        self._apply_name_templating(template_resource)
-        self._apply_namespace_templating(template_resource)
-        self._apply_image_templating(template_resource)
-        self._apply_replica_templating(template_resource)
-        self._apply_label_templating(template_resource)
-        self._apply_annotation_templating(template_resource)
-        
-        return template_resource
-    
-    def _apply_name_templating(self, resource: Dict[str, Any]) -> None:
-        """Apply name templating to resource."""
-        metadata = resource.get('metadata', {})
-        if 'name' in metadata:
-            original_name = metadata['name']
-            # Use Helm naming convention
-            metadata['name'] = f"{{{{ include \"{self.chart_name}.fullname\" . }}}}"
-            
-            # Store original name as a comment or annotation for reference
-            if 'annotations' not in metadata:
-                metadata['annotations'] = {}
-            metadata['annotations']['helm.sh/original-name'] = original_name
-    
-    def _apply_namespace_templating(self, resource: Dict[str, Any]) -> None:
-        """Apply namespace templating to resource."""
-        metadata = resource.get('metadata', {})
-        if 'namespace' in metadata:
-            metadata['namespace'] = "{{ .Values.namespace | default .Release.Namespace }}"
-    
-    def _apply_image_templating(self, resource: Dict[str, Any]) -> None:
-        """Apply image templating to resource."""
-        if resource.get('kind') == 'Deployment':
-            spec = resource.get('spec', {})
-            template = spec.get('template', {})
-            pod_spec = template.get('spec', {})
-            containers = pod_spec.get('containers', [])
-            
-            for container in containers:
-                if 'image' in container:
-                    container['image'] = "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-                
-                if 'imagePullPolicy' in container:
-                    container['imagePullPolicy'] = "{{ .Values.image.pullPolicy }}"
-    
-    def _apply_replica_templating(self, resource: Dict[str, Any]) -> None:
-        """Apply replica templating to resource."""
-        if resource.get('kind') == 'Deployment':
-            spec = resource.get('spec', {})
-            if 'replicas' in spec:
-                spec['replicas'] = "{{ .Values.replicaCount }}"
-    
-    def _apply_label_templating(self, resource: Dict[str, Any]) -> None:
-        """Apply label templating to resource."""
-        metadata = resource.get('metadata', {})
-        
-        # Add standard Helm labels
-        if 'labels' not in metadata:
-            metadata['labels'] = {}
-        
-        standard_labels = {
-            'helm.sh/chart': f"{{{{ include \"{self.chart_name}.chart\" . }}}}",
-            'app.kubernetes.io/name': f"{{{{ include \"{self.chart_name}.name\" . }}}}",
-            'app.kubernetes.io/instance': "{{ .Release.Name }}",
-            'app.kubernetes.io/version': "{{ .Chart.AppVersion | quote }}",
-            'app.kubernetes.io/managed-by': "{{ .Release.Service }}"
-        }
-        
-        metadata['labels'].update(standard_labels)
-        
-        # Add common labels if they exist
-        metadata['labels']['{{- with .Values.commonLabels }}'] = None
-        metadata['labels']['{{- toYaml . | nindent 4 }}'] = None
-        metadata['labels']['{{- end }}'] = None
-    
-    def _apply_annotation_templating(self, resource: Dict[str, Any]) -> None:
-        """Apply annotation templating to resource."""
-        metadata = resource.get('metadata', {})
-        
-        if 'annotations' not in metadata:
-            metadata['annotations'] = {}
-        
-        # Add common annotations if they exist - handle this in post-processing
-        if hasattr(self, 'common_annotations') and self.common_annotations:
-            metadata['annotations'].update(self.common_annotations)
-    
-    def _write_chart_yaml(self) -> None:
-        """Write the Chart.yaml file."""
-        chart_yaml_path = self.chart_dir / "Chart.yaml"
-        
-        with open(chart_yaml_path, 'w') as f:
-            yaml.dump(self.chart_metadata, f, default_flow_style=False)
-        
-        logger.info("Generated Chart.yaml")
-    
-    def _write_values_yaml(self) -> None:
-        """Write the values.yaml file."""
-        values_yaml_path = self.chart_dir / "values.yaml"
-        
-        # Configure YAML dumper for multi-line strings
-        self._write_values_file(values_yaml_path, self.values)
-        
-        logger.info("Generated values.yaml")
-    
-    def _write_values_file(self, file_path: Path, values: Dict[str, Any]) -> None:
-        """Write values file with proper YAML formatting for multi-line strings."""
-        # Create a custom YAML dumper class
-        class MultiLineDumper(yaml.SafeDumper):
-            pass
-        
-        # Custom YAML representer for multi-line strings
-        def represent_multiline_str(dumper, data):
-            # Force literal block style for any string with newlines
-            # This handles ConfigMap data properly
-            if '\n' in data and len(data.split('\n')) > 2:
-                return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|-')
-            return dumper.represent_scalar('tag:yaml.org,2002:str', data)
-        
-        MultiLineDumper.add_representer(str, represent_multiline_str)
-        
-        # Process values to ensure proper formatting
-        processed_values = self._process_values_for_multiline(values)
-        
-        with open(file_path, 'w') as f:
-            yaml.dump(processed_values, f, default_flow_style=False, allow_unicode=True, Dumper=MultiLineDumper)
-    
-    def _process_values_for_multiline(self, values: Dict[str, Any]) -> Dict[str, Any]:
-        """Process values to ensure proper multi-line string formatting."""
-        processed = {}
-        
-        for key, value in values.items():
-            if isinstance(value, dict):
-                processed[key] = self._process_values_for_multiline(value)
-            elif isinstance(value, str):
-                # Handle escaped newlines in strings (common in ConfigMap data)
-                if '\\n' in value:
-                    # Convert escaped newlines to actual newlines
-                    processed[key] = value.replace('\\n', '\n').strip()
-                elif '\n' in value:
-                    # Already has newlines, just strip
-                    processed[key] = value.strip()
-                else:
-                    processed[key] = value
-            else:
-                processed[key] = value
-        
-        return processed
-    
-    def _write_helpers_template(self) -> None:
-        """Write the _helpers.tpl file with common template functions."""
-        helpers_content = f'''{{/*
-Expand the name of the chart.
-*/}}
-{{{{- define "{self.chart_name}.name" -}}}}
-{{{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}}}
-{{{{- end }}}}
-
-{{/*
-Create a default fully qualified app name.
-We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
-If release name contains chart name it will be used as a full name.
-*/}}
-{{{{- define "{self.chart_name}.fullname" -}}}}
-{{{{- if .Values.fullnameOverride }}}}
-{{{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}}}
-{{{{- else }}}}
-{{{{- $name := default .Chart.Name .Values.nameOverride }}}}
-{{{{- if contains $name .Release.Name }}}}
-{{{{- .Release.Name | trunc 63 | trimSuffix "-" }}}}
-{{{{- else }}}}
-{{{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}}}
-{{{{- end }}}}
-{{{{- end }}}}
-{{{{- end }}}}
-
-{{/*
-Create chart name and version as used by the chart label.
-*/}}
-{{{{- define "{self.chart_name}.chart" -}}}}
-{{{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}}}
-{{{{- end }}}}
-
-{{/*
-Common labels
-*/}}
-{{{{- define "{self.chart_name}.labels" -}}}}
-helm.sh/chart: {{{{ include "{self.chart_name}.chart" . }}}}
-{{{{ include "{self.chart_name}.selectorLabels" . }}}}
-{{{{- if .Chart.AppVersion }}}}
-app.kubernetes.io/version: {{{{ .Chart.AppVersion | quote }}}}
-{{{{- end }}}}
-app.kubernetes.io/managed-by: {{{{ .Release.Service }}}}
-{{{{- end }}}}
-
-{{/*
-Selector labels
-*/}}
-{{{{- define "{self.chart_name}.selectorLabels" -}}}}
-app.kubernetes.io/name: {{{{ include "{self.chart_name}.name" . }}}}
-app.kubernetes.io/instance: {{{{ .Release.Name }}}}
-{{{{- end }}}}
-
-{{/*
-Create the name of the service account to use
-*/}}
-{{{{- define "{self.chart_name}.serviceAccountName" -}}}}
-{{{{- if .Values.serviceAccount.create }}}}
-{{{{- default (include "{self.chart_name}.fullname" .) .Values.serviceAccount.name }}}}
-{{{{- else }}}}
-{{{{- default "default" .Values.serviceAccount.name }}}}
-{{{{- end }}}}
-{{{{- end }}}}
-'''
-        
-        helpers_path = self.templates_dir / "_helpers.tpl"
-        with open(helpers_path, 'w') as f:
-            f.write(helpers_content)
-        
-        logger.info("Generated _helpers.tpl")
-    
-    def _post_process_template_yaml(self, resource: Dict[str, Any]) -> str:
-        """Post-process template YAML to add proper Helm templating."""
-        # First, generate the base YAML
-        yaml_content = yaml.dump(resource, default_flow_style=False)
-        
-        # Add common annotations and labels templating
-        if 'metadata' in resource and 'annotations' in resource['metadata']:
-            # Add Helm templating for common annotations
-            annotation_template = """{{- with .Values.commonAnnotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}"""
-            
-            # Insert the template after existing annotations
-            lines = yaml_content.split('\n')
-            in_annotations = False
-            annotation_indent = 0
-            insert_index = -1
-            
-            for i, line in enumerate(lines):
-                if 'annotations:' in line and 'metadata:' in lines[max(0, i-5):i]:
-                    in_annotations = True
-                    annotation_indent = len(line) - len(line.lstrip())
-                elif in_annotations and line.strip() and not line.startswith(' ' * (annotation_indent + 2)):
-                    # We've left the annotations section
-                    insert_index = i
-                    break
-                elif in_annotations and i == len(lines) - 1:
-                    # End of file
-                    insert_index = i + 1
-                    break
-            
-            if insert_index > 0:
-                # Insert the template
-                template_lines = annotation_template.split('\n')
-                formatted_template = []
-                for template_line in template_lines:
-                    if template_line.strip():
-                        formatted_template.append(' ' * (annotation_indent + 2) + template_line.strip())
-                    else:
-                        formatted_template.append('')
-                
-                lines[insert_index:insert_index] = formatted_template
-                yaml_content = '\n'.join(lines)
-        
-        return yaml_content
+        if overlays:
+            lines.extend(["", "Render an overlay with:", ""])
+            for name in sorted(overlays):
+                safe = self._safe_overlay_filename(name)
+                lines.append(f"    helm template RELEASE . -f values-{safe}.yaml  # {name}")
+        lines.extend(
+            [
+                "",
+                "Do not use `tpl` on manifest values: literal `{{ ... }}` content may belong to",
+                "the application and is intentionally preserved verbatim.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
