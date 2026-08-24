@@ -1,68 +1,111 @@
 # kustomize-to-helm
 
-`kustomize-to-helm` (`k2h`) is a fidelity-first migration framework that turns a
-Kustomize base—or a base plus all of its overlays—into a Helm chart and proves
-that Helm renders the same Kubernetes resources.
+`kustomize-to-helm` converts a Kustomize application into a Helm chart.
 
-The important design choice is simple: **Kustomize renders the source of truth**.
-The framework does not attempt to reimplement strategic merge patches, JSON
-patches, transformers, name references, generator hashes, image rewrites, or CRD
-semantics in Python. It asks Kustomize for the final manifests, creates a
-values-driven Helm resource catalog, runs `helm lint`, renders the chart, and
-compares every resource to the Kustomize output before replacing the destination.
+The command-line tool is called `k2h`.
 
-## What it handles
+Its main goal is safety. A migration should not look correct while quietly
+changing your Kubernetes resources. The tool therefore builds the source with
+Kustomize, creates the Helm chart, renders that chart with Helm, and compares the
+two results before reporting success.
 
-- Strategic merge, JSON 6902, and unified `patches`
-- Name prefixes/suffixes, namespaces, labels, annotations, images, and replicas
-- ConfigMap and Secret generators, including file/env inputs and hash suffixes
-- Multiple containers, ports, arbitrary custom resources, and multi-document YAML
-- Overlay-added, overlay-modified, renamed, and overlay-removed resources
-- Literal application content containing `{{ ... }}` without evaluating it as Helm
-- Duplicate YAML keys, broken references, build timeouts, duplicate Kubernetes
-  identities, invalid chart names, missing tools, and unsafe overwrite attempts
-- Transactional `--force`: the old chart stays intact until the replacement passes
-  validation
+## How it works
+
+For a normal migration, the tool follows these steps:
+
+1. Run `kustomize build` on the source.
+2. Read and validate every rendered Kubernetes resource.
+3. Generate a Helm chart from those final resources.
+4. Run strict `helm lint` on the generated chart.
+5. Run `helm template`.
+6. Compare the complete Helm output with the Kustomize output.
+
+If a resource is missing, added unexpectedly, or changed, the migration fails.
+The destination is not replaced until validation passes.
+
+The YAML text may use different whitespace, quotes, or key ordering. The parsed
+Kubernetes objects—including names, namespaces, fields, lists, and values—must be
+the same.
+
+## What it supports
+
+The tool works with final resources rendered by Kustomize, so it can preserve:
+
+- strategic merge, JSON 6902, and unified patches;
+- name prefixes, suffixes, namespaces, labels, and annotations;
+- image names, tags, digests, and replica changes;
+- ConfigMap and Secret generators, including generated name hashes;
+- base and overlay resource additions, changes, renames, and deletions;
+- Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, and Services;
+- RBAC, Ingress, Gateway API, autoscaling, policies, and storage resources;
+- CRDs and arbitrary custom resources;
+- multiple containers, init containers, volumes, probes, and security settings;
+- multiline data and application text containing literal `{{ ... }}` expressions.
+
+The framework does not try to recreate Kustomize behavior in Python. Kustomize
+itself produces the source manifests used for migration.
 
 ## Requirements
 
-- Python 3.8+
-- [Kustomize](https://kubectl.docs.kubernetes.io/installation/kustomize/) on `PATH`,
-  or `kubectl` with `kubectl kustomize`
-- [Helm 3](https://helm.sh/docs/intro/install/) on `PATH` for the default lint and
-  equivalence verification
+- Python 3.8 or newer
+- `kustomize` on `PATH`, or `kubectl` with `kubectl kustomize`
+- Helm 3 on `PATH`
 
-Install locally:
+Helm is required for the normal verified migration. You can explicitly use
+`--no-verify`, but that removes the equivalence guarantee.
+
+## Installation
 
 ```bash
+git clone <repository-url>
+cd kustomize-to-helm
+
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
+
 k2h --version
 ```
 
-## Single configuration
+## Migrate one Kustomize configuration
+
+First, inspect the source:
 
 ```bash
 k2h analyze ./kustomize
-k2h migrate ./kustomize ./charts --chart-name my-app
-helm template test ./charts/my-app
 ```
 
-Use `--dry-run` to build and analyze without writing. A pre-existing chart is a
-hard error unless `--force` is supplied. `--force` replaces it transactionally.
+Then create the chart:
 
-## Base plus overlays
+```bash
+k2h migrate ./kustomize ./charts --chart-name my-app
+```
 
-Given:
+The generated chart is written to:
+
+```text
+charts/my-app/
+```
+
+Render it normally with Helm:
+
+```bash
+helm template my-release ./charts/my-app
+```
+
+## Migrate a base with overlays
+
+Example source structure:
 
 ```text
 app/
 ├── base/
 │   └── kustomization.yaml
 └── overlays/
-    ├── dev/kustomization.yaml
-    └── prod/kustomization.yaml
+    ├── dev/
+    │   └── kustomization.yaml
+    └── production/
+        └── kustomization.yaml
 ```
 
 Run:
@@ -73,51 +116,142 @@ k2h migrate ./app/base ./charts \
   --chart-name my-app
 ```
 
-This creates `values.yaml`, `values-dev.yaml`, and `values-prod.yaml`. Each file is
-verified against its corresponding Kustomize build:
+The chart will contain separate values files:
 
-```bash
-helm template test ./charts/my-app -f ./charts/my-app/values-dev.yaml
+```text
+charts/my-app/
+├── Chart.yaml
+├── values.yaml
+├── values-dev.yaml
+├── values-production.yaml
+├── MIGRATION.md
+└── templates/
+    ├── NOTES.txt
+    └── resources.yaml
 ```
 
-Every immediate, non-hidden directory below `--overlays-dir` is treated as an
-overlay. A broken overlay fails the complete migration; it is never silently
-skipped.
+Render an environment with its values file:
 
-## Generated chart model
+```bash
+helm template my-release ./charts/my-app \
+  -f ./charts/my-app/values-production.yaml
+```
 
-`values.yaml` contains a stable key for each Kubernetes identity:
+Every immediate, non-hidden directory under `--overlays-dir` is treated as an
+overlay. If one overlay is broken, the complete migration fails. Broken overlays
+are never silently skipped.
+
+## Why manifests are stored in values
+
+Each Kubernetes resource is stored as a complete manifest in `values.yaml`:
 
 ```yaml
 resources:
-  deployment-default-api-2f89d8c1a0:
+  deployment-api-2f89d8c1a0:
     enabled: true
     manifest: |
       apiVersion: apps/v1
       kind: Deployment
-      # ...complete rendered resource...
+      metadata:
+        name: api
+      # ...the rest of the rendered resource...
 ```
 
-Overlay values explicitly enable or disable every catalogued resource, so even
-stacked values files are deterministic. They replace the complete manifest string
-only for changed resources. Storing changed manifests as strings is intentional:
-Helm's normal deep map merge cannot represent field deletion faithfully.
+This is intentional. Normal Helm map merging cannot faithfully represent every
+field deletion, list replacement, generated resource, or custom resource.
 
-This model prioritizes safe migration over guessing which fields should become a
-shared value. After equivalence is established, teams can refactor selected
-manifest fields into conventional Helm values under normal review and testing.
+Overlay files enable or disable the correct resources and replace only the
+manifests that changed. This keeps the first migration accurate. After the chart
+is verified, teams can gradually move selected fields into conventional Helm
+values under their normal review process.
 
-## Validation and machine-readable reports
+## Safe overwrite behavior
+
+The tool will not overwrite an existing chart unless you pass `--force`:
+
+```bash
+k2h migrate ./kustomize ./charts --chart-name my-app --force
+```
+
+The replacement is transactional. The existing chart remains in place while the
+new chart is generated and validated. If validation fails, the old chart is kept.
+
+## Useful commands
+
+Run without writing files:
+
+```bash
+k2h migrate ./kustomize ./charts --chart-name my-app --dry-run
+```
+
+Produce a JSON report:
+
+```bash
+k2h migrate ./kustomize ./charts --chart-name my-app --output-format json
+```
+
+Validate an existing chart:
 
 ```bash
 k2h validate ./charts/my-app --strict
-k2h migrate ./kustomize ./charts -f json
-k2h analyze ./kustomize -f yaml -o analysis.yaml
 ```
 
-JSON and YAML modes write only the report to stdout; logs and warnings go to
-stderr. Migration validation compares parsed Kubernetes objects by
-`apiVersion`, `kind`, namespace, and name, then compares their complete content.
+Replace an existing chart:
+
+```bash
+k2h migrate ./kustomize ./charts --chart-name my-app --force
+```
+
+Skip Helm verification explicitly:
+
+```bash
+k2h migrate ./kustomize ./charts --chart-name my-app --no-verify
+```
+
+## Errors the tool handles
+
+The migration stops with a clear error for cases such as:
+
+- invalid or duplicate YAML keys;
+- missing files and broken Kustomize references;
+- failed or timed-out Kustomize builds;
+- duplicate Kubernetes resource identities;
+- invalid Helm chart names or versions;
+- overlay values filename collisions;
+- failed Helm lint or rendering;
+- any difference between Helm and Kustomize output;
+- an existing destination without `--force`;
+- failed validation during an overwrite.
+
+The tool also blocks source `helm.sh/hook` and `helm.sh/resource-policy`
+annotations. These annotations do nothing in Kustomize but change resource
+lifecycle behavior in Helm, so automatically migrating them would be misleading.
+
+## Secrets and CRDs
+
+Rendered Secret data is copied into the generated values files. Treat the chart
+as sensitive and use your normal secret-management process before committing it.
+
+CRDs are kept in the chart templates so the generated output stays equal to the
+Kustomize output. Review your organization's CRD installation and upgrade policy
+before deploying the chart.
+
+## What verification cannot cover
+
+The tool verifies local rendered output. It cannot reproduce behavior that only
+happens inside a Kubernetes cluster, including:
+
+- API server default values;
+- admission and mutation webhooks;
+- cluster-specific API availability;
+- changes made to live resources after installation.
+
+Remote Kustomize resources also depend on network access and upstream
+availability. Pin remote versions when possible.
+
+Executable or alpha Kustomize plugins are not enabled automatically because they
+may run code. Python callers can provide an explicit build command when those
+features are required and trusted.
 
 ## Python API
 
@@ -131,43 +265,39 @@ migrator = KustomizeToHelmMigrator(
     overwrite=False,
     verify=True,
 )
+
 report = migrator.migrate()
+print(report["status"])
+print(report["validation"])
 ```
 
-For custom Kustomize flags, pass a command prefix through the API, for example
-`build_command=["kustomize", "build", "--enable-helm"]`. The source directory is
-appended by the framework. Alpha/exec plugins are not enabled automatically
-because they may execute code.
+To supply trusted custom Kustomize flags:
 
-## Security and limitations
+```python
+migrator = KustomizeToHelmMigrator(
+    kustomize_dir="./kustomize",
+    output_dir="./charts",
+    build_command=["kustomize", "build", "--enable-helm"],
+)
+```
 
-- Rendered Secrets are necessarily copied into chart values. Treat the output as
-  sensitive and use an external secret system before committing when appropriate.
-- Remote Kustomize resources require network access and remain subject to upstream
-  availability and pinning. Pin remote references for reproducible migrations.
-- Verification proves local rendered-object equivalence. It does not reproduce API
-  server defaulting, admission webhooks, cluster capabilities, or live-state drift.
-- Resources using `metadata.generateName` are accepted with a warning because they
-  are not upgrade-stable in Helm.
-- Source `helm.sh/hook` and `helm.sh/resource-policy` annotations block migration:
-  they are inert under Kustomize but change lifecycle behavior under Helm, so they
-  require an explicit manual redesign instead of a misleading equivalence result.
-- Helm verification may be skipped only when `--no-verify` is explicit. The
-  skipped check is prominently recorded in the report.
+The source directory is appended to the command by the framework.
 
-## Development
+## Tests
+
+Run all checks locally:
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q kustomize_to_helm
 ruff check .
+python -m compileall -q kustomize_to_helm tests
+python -m unittest discover -s tests -v
 ```
 
-The critical integration fixture covers RBAC name references, generated
-ConfigMaps/Secrets and hashes, replacements, strategic and JSON patches, field and
-resource deletion, image digests with registry ports, multiple containers,
-StatefulSets and PVC templates, HPA/PDB/NetworkPolicy, Ingress and Gateway API,
-CRDs and arbitrary custom resources, components, multiline data, and literal Helm
-tokens. Both production and canary overlays—as well as stacked values files—must
-render identically to Kustomize. Integration tests automatically skip when
-Kustomize or Helm is unavailable.
+The test suite includes simple, failure, and critical-complexity migrations. The
+critical fixture covers production and canary overlays, generated Secrets and
+ConfigMaps, CRDs, custom resources, RBAC references, patches, deletion, image
+digests, multiple containers, StatefulSets, policies, Gateway API, multiline
+data, and literal Helm expressions.
+
+The integration tests compare the complete parsed Kustomize and Helm outputs.
+They skip automatically when Kustomize or Helm is not installed.
